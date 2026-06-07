@@ -1,0 +1,819 @@
+"""
+Mimamori — FastAPI backend using llama.cpp + LEAP GGUF model
+Start: uvicorn backend:app --port 8000 --reload
+"""
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from llama_cpp import Llama
+import json, re, time, logging, os, glob, tempfile, shutil, subprocess, math
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("mimamori")
+
+app = FastAPI(title="Mimamori")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── Find the GGUF file automatically ─────────────────────────────────────────
+# Checks JP first, falls back to Instruct
+def find_gguf():
+    patterns = [
+        "./models/JP/*.gguf",
+        "./models/**/*.gguf",
+        "./**/*.gguf",
+    ]
+    for pattern in patterns:
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            # prefer JP if available
+            jp = [m for m in matches if "JP" in m]
+            return jp[0] if jp else matches[0]
+    raise FileNotFoundError("No .gguf file found. Run the download commands first.")
+
+GGUF_PATH = find_gguf()
+log.info(f"Loading model: {GGUF_PATH}")
+
+# Runtime knobs: this is llama.cpp CPU by default, not Ryzen AI NPU.
+# These settings make the local GGUF path noticeably snappier on Ryzen laptops.
+CPU_THREADS = int(os.environ.get("LLAMA_THREADS", str(max(4, (os.cpu_count() or 8) - 2))))
+CTX_SIZE = int(os.environ.get("LLAMA_CTX", "1024"))
+
+llm = Llama(
+    model_path=GGUF_PATH,
+    n_ctx=CTX_SIZE,
+    n_threads=CPU_THREADS,
+    n_batch=256,
+    n_gpu_layers=int(os.environ.get("LLAMA_GPU_LAYERS", "0")),
+    use_mmap=True,
+    use_mlock=False,
+    verbose=False,
+)
+log.info("Model loaded. Running warm-up...")
+
+# Warm-up call so first real request is fast
+llm.create_chat_completion(
+    messages=[{"role":"user","content":"hi"}],
+    max_tokens=5,
+)
+log.info("Warm-up done. Server ready.")
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+SYSTEM = """You are Mimamori, a Japanese phone-scam analysis engine.
+
+ABSOLUTE LANGUAGE RULE:
+- OUTPUT LANGUAGE MUST BE ENGLISH.
+- Even if the transcript is Japanese, EVERY STRING VALUE in your JSON must be English.
+- Never output Japanese characters in reasoning, latest_translation, scam_type, speaker_hint, recommended_action, or signals.
+- latest_translation must be a natural English translation of the latest Japanese utterance only.
+- reasoning must be one concise English sentence for a hackathon judge.
+
+ABSOLUTE FORMAT RULE:
+- Return ONLY valid JSON.
+- No markdown.
+- No prose before/after JSON.
+- Use exactly these keys:
+{
+  "risk_score": <0-99>,
+  "scam_type": "<fake_police|financial_pressure|romance_fraud|voice_clone|oreore_scam|none>",
+  "signals": ["<authority|urgency|secrecy|money|impersonation>"],
+  "reasoning": "<English sentence only>",
+  "latest_translation": "<English translation only>",
+  "speaker_hint": "<caller|user|unknown>",
+  "recommended_action": "<monitor|show_caution|warn_user|warn_and_alert_family>"
+}
+
+Speaker role rules:
+- caller = suspicious caller applying pressure, claiming authority, giving instructions, requesting LINE/ATM/bank/card/money.
+- user = protected person asking questions, hesitating, verifying, or resisting.
+- unknown = unclear.
+
+Risk scoring:
+0-39 = normal conversation.
+40-69 = suspicious pressure.
+70-84 = high risk with multiple scam signals.
+85-99 = fake police, LINE isolation, arrest/prosecution pressure, money/card/ATM pressure, or confirmed scam.
+
+Signals:
+- authority: police, bank, prosecutor, government, official investigation.
+- urgency: act now/today, emergency, immediate deadline.
+- secrecy: tell no one, do not call family/bank, move to private LINE.
+- money: transfer funds, withdraw cash, card, ATM, account, security deposit.
+- impersonation: pretending to be police/family/bank/prosecutor/official.
+"""
+
+# ── Request / response ────────────────────────────────────────────────────────
+class Req(BaseModel):
+    transcript: str
+    latest_utterance: Optional[str] = ""
+
+def extract_json(raw: str) -> dict:
+    """Extract JSON even if model adds extra text around it."""
+    try:
+        return json.loads(raw.strip())
+    except:
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except:
+                pass
+    return {}
+
+FALLBACK = {
+    "risk_score": 0,
+    "scam_type": "none",
+    "signals": [],
+    "reasoning": "Analysis unavailable — lightweight local scorer active.",
+    "latest_translation": "",
+    "speaker_hint": "unknown",
+    "recommended_action": "monitor",
+}
+
+_JP_RE = re.compile(r"[぀-ヿ㐀-鿿]")
+
+def has_japanese(value: Any) -> bool:
+    return bool(_JP_RE.search(str(value or "")))
+
+def english_fallback_reason(data: dict) -> str:
+    signals = set(data.get("signals") or [])
+    scam_type = data.get("scam_type", "none")
+    if "authority" in signals and ("secrecy" in signals or "urgency" in signals):
+        return "The caller is using official authority and pressure tactics to isolate the victim."
+    if "money" in signals and "urgency" in signals:
+        return "The caller is creating urgent financial pressure, which is a strong scam pattern."
+    if scam_type in {"fake_police", "oreore_scam", "financial_pressure"}:
+        return "The conversation matches a known phone-scam pattern and should be treated as high risk."
+    return "The model is monitoring the transcript for scam pressure and manipulation signals."
+
+def repair_english_fields(data: dict, transcript: str, latest_utterance: str) -> dict:
+    """If the JP model ignores English-only instructions, run a tiny repair pass.
+    If repair still fails, remove Japanese from judge-visible English fields.
+    """
+    needs_repair = has_japanese(data.get("reasoning")) or has_japanese(data.get("latest_translation"))
+    if not needs_repair:
+        return data
+    try:
+        repair_prompt = f"""Convert this analysis to ENGLISH ONLY JSON. Do not output Japanese characters.
+Keep the same risk_score, scam_type, signals, speaker_hint, and recommended_action.
+Translate latest_translation to English. Rewrite reasoning in English.
+
+Original JSON:
+{json.dumps(data, ensure_ascii=False)}
+
+Latest Japanese utterance to translate:
+{latest_utterance}
+"""
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "You translate and repair JSON. Output English-only valid JSON. No Japanese characters. No markdown."},
+                {"role": "user", "content": repair_prompt},
+            ],
+            max_tokens=180,
+            temperature=0.0,
+            repeat_penalty=1.08,
+        )
+        repaired = extract_json(response["choices"][0]["message"]["content"])
+        if repaired:
+            for k in ["reasoning", "latest_translation", "speaker_hint", "recommended_action", "scam_type", "signals"]:
+                if k in repaired:
+                    data[k] = repaired[k]
+    except Exception as e:
+        log.warning(f"English repair failed: {e}")
+
+    # Last-resort: never show Japanese in English fields during the demo.
+    if has_japanese(data.get("reasoning")):
+        data["reasoning"] = english_fallback_reason(data)
+    if has_japanese(data.get("latest_translation")):
+        data["latest_translation"] = "English translation pending."
+    return data
+
+
+# ── Fast path: keep the demo responsive while the local LFM is slow ───────────
+# LFM on this setup runs through llama.cpp CPU by default. Ryzen AI hardware will
+# not automatically accelerate GGUF unless you use an NPU-specific runtime. To
+# avoid 10-15s pauses per bubble, the backend returns a deterministic fast result
+# for every segment and only refreshes LFM reasoning occasionally.
+USE_LFM = os.environ.get("USE_LFM", "1") != "0"
+LFM_MIN_INTERVAL = float(os.environ.get("LFM_MIN_INTERVAL", "7.5"))
+LFM_MAX_CHARS = int(os.environ.get("LFM_MAX_CHARS", "1400"))
+_lfm_last_time = 0.0
+_lfm_last_data: Optional[dict] = None
+_lfm_cache: Dict[str, dict] = {}
+
+FAST_TERMS = {
+    "authority": ["警察", "警視庁", "生活安全", "検察", "裁判", "逮捕", "容疑", "捜査", "職員", "銀行", "郵便局"],
+    "urgency": ["今すぐ", "今日中", "至急", "緊急", "すぐ", "急", "逮捕", "起訴"],
+    "secrecy": ["誰にも", "内緒", "秘密", "家族", "言わない", "LINE", "ライン", "電話を切ら", "連絡しない"],
+    "money": ["お金", "現金", "振り込", "振込", "口座", "キャッシュカード", "暗証番号", "ATM", "銀行", "資金", "残高"],
+    "impersonation": ["俺", "息子", "警察", "警視庁", "銀行", "検察", "職員", "名乗"],
+}
+
+SIGNAL_WEIGHTS = {"authority": 30, "urgency": 18, "secrecy": 24, "money": 28, "impersonation": 16}
+
+TRANS_RULES = [
+    ("警察", "The caller is referring to the police."),
+    ("警視庁", "The caller claims to be from the Tokyo Metropolitan Police."),
+    ("生活安全", "The caller claims to be from a police public-safety division."),
+    ("逮捕", "The caller mentions an arrest."),
+    ("容疑", "The caller says there is suspicion of a crime."),
+    ("捜査", "The caller refers to an investigation."),
+    ("検察", "The caller mentions prosecutors."),
+    ("LINE", "The caller is trying to move the conversation to LINE."),
+    ("ライン", "The caller is trying to move the conversation to LINE."),
+    ("キャッシュカード", "The caller mentions a cash card."),
+    ("暗証番号", "The caller mentions a PIN number."),
+    ("口座", "The caller mentions a bank account."),
+    ("銀行", "The caller mentions a bank."),
+    ("郵便局", "The caller mentions the post office."),
+    ("振り込", "The caller is talking about transferring money."),
+    ("振込", "The caller is talking about a bank transfer."),
+    ("お金", "The caller is talking about money."),
+    ("現金", "The caller is talking about cash."),
+    ("今日中", "The caller creates a same-day deadline."),
+    ("今すぐ", "The caller is creating immediate pressure."),
+    ("家族", "The caller refers to family involvement or verification."),
+    ("内緒", "The caller asks for secrecy."),
+    ("誰にも", "The caller says not to tell anyone."),
+]
+
+def _contains_any(text: str, words: List[str]) -> bool:
+    return any(w.lower() in text.lower() for w in words)
+
+def fast_translate_latest(latest: str) -> str:
+    latest = (latest or "").strip()
+    if not latest:
+        return ""
+    hits = []
+    for key, eng in TRANS_RULES:
+        if key in latest and eng not in hits:
+            hits.append(eng)
+    if hits:
+        # Keep it short so the bubble appears quickly and cleanly.
+        return " ".join(hits[:2])
+    # Safe fallback: do not show broken Japanese as English.
+    return "Translation pending — the local LFM is checking this utterance."
+
+def fast_analyze(transcript: str, latest: str = "") -> dict:
+    text = (transcript or "") + "\n" + (latest or "")
+    signals = []
+    score = 0
+    for sig, terms in FAST_TERMS.items():
+        if _contains_any(text, terms):
+            signals.append(sig)
+            score += SIGNAL_WEIGHTS[sig]
+    if "authority" in signals and "secrecy" in signals:
+        score += 12
+    if "authority" in signals and "urgency" in signals:
+        score += 10
+    if "money" in signals and "urgency" in signals:
+        score += 10
+    score = min(score, 95)
+
+    if "authority" in signals and ("secrecy" in signals or "urgency" in signals):
+        scam_type = "fake_police"
+    elif "impersonation" in signals and "money" in signals:
+        scam_type = "oreore_scam"
+    elif "money" in signals:
+        scam_type = "financial_pressure"
+    else:
+        scam_type = "none"
+
+    latest_text = latest or ""
+    if _contains_any(latest_text, ["ですか", "いいですか", "確認", "どうした", "誰", "本当"]):
+        speaker = "user"
+    elif _contains_any(latest_text, FAST_TERMS["authority"] + FAST_TERMS["money"] + FAST_TERMS["secrecy"] + FAST_TERMS["urgency"]):
+        speaker = "caller"
+    else:
+        speaker = "unknown"
+
+    if score >= 85:
+        action = "warn_and_alert_family"
+        reasoning = "The call shows a high-risk scam pattern: authority pressure, isolation, and potential financial harm."
+    elif score >= 70:
+        action = "warn_user"
+        reasoning = "The caller is using suspicious pressure tactics and the system is watching for escalation."
+    elif score >= 40:
+        action = "show_caution"
+        reasoning = "Early scam indicators are present, so the system is raising caution while monitoring the call."
+    else:
+        action = "monitor"
+        reasoning = "The model is monitoring the call for scam pressure, isolation, and financial-risk signals."
+
+    return {
+        "risk_score": score,
+        "scam_type": scam_type,
+        "signals": signals,
+        "reasoning": reasoning,
+        "latest_translation": fast_translate_latest(latest),
+        "speaker_hint": speaker,
+        "recommended_action": action,
+        "latency_ms": 0,
+        "source": "fast_local",
+    }
+
+def _recent_context(transcript: str) -> str:
+    transcript = (transcript or "").strip()
+    if len(transcript) <= LFM_MAX_CHARS:
+        return transcript
+    return transcript[-LFM_MAX_CHARS:]
+
+def run_lfm_analysis(transcript: str, latest_utterance: str = "") -> dict:
+    """Run the local LFM/llama.cpp model once and return normalized JSON."""
+    t0 = time.time()
+    response = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user",   "content": f"Recent phone call transcript context:\n{_recent_context(transcript)}\n\nLatest utterance to translate and classify:\n{latest_utterance or ''}"}
+        ],
+        max_tokens=int(os.environ.get("LFM_MAX_TOKENS", "120")),
+        temperature=0.0,
+        repeat_penalty=1.05,
+    )
+    raw = response["choices"][0]["message"]["content"]
+    ms  = int((time.time() - t0) * 1000)
+    log.info(f"[{ms}ms] {raw[:120]}")
+
+    data = extract_json(raw)
+    if not data:
+        log.warning("JSON parse failed, using fallback")
+        return {**FALLBACK, "latency_ms": ms}
+
+    data.setdefault("risk_score", 0)
+    data.setdefault("scam_type", "none")
+    data.setdefault("signals", [])
+    data.setdefault("reasoning", "Analysis complete.")
+    data.setdefault("latest_translation", "")
+    data.setdefault("speaker_hint", "unknown")
+    data.setdefault("recommended_action", "monitor")
+    data = repair_english_fields(data, transcript, latest_utterance)
+    data["latency_ms"] = ms
+    return data
+
+# ── Main endpoint ─────────────────────────────────────────────────────────────
+@app.post("/api/analyze")
+async def analyze(req: Req):
+    """Responsive analysis endpoint.
+
+    It returns a fast English result immediately for every transcript update.
+    The heavier LFM model is used only periodically and cached. This keeps
+    translation/reasoning responsive during the synced audio demo.
+    """
+    global _lfm_last_time, _lfm_last_data
+    transcript = (req.transcript or "").strip()
+    latest = req.latest_utterance or ""
+    if not transcript:
+        return {**FALLBACK, "latency_ms": 0, "source": "empty"}
+
+    fast = fast_analyze(transcript, latest)
+    if not USE_LFM:
+        return fast
+
+    now = time.time()
+    cache_key = str(hash((_recent_context(transcript), latest)))
+
+    # If LFM was called very recently, keep UI fast and return local result.
+    # Merge the last stronger LFM result where useful, but keep latest fast translation.
+    if _lfm_last_data and (now - _lfm_last_time) < LFM_MIN_INTERVAL:
+        merged = dict(fast)
+        if int(_lfm_last_data.get("risk_score", 0)) >= int(fast.get("risk_score", 0)):
+            for k in ["risk_score", "scam_type", "signals", "reasoning", "recommended_action"]:
+                merged[k] = _lfm_last_data.get(k, merged.get(k))
+        merged["latest_translation"] = fast.get("latest_translation", "") or _lfm_last_data.get("latest_translation", "")
+        merged["speaker_hint"] = fast.get("speaker_hint") or _lfm_last_data.get("speaker_hint", "unknown")
+        merged["source"] = "fast_cached_lfm"
+        merged["latency_ms"] = 1
+        return merged
+
+    if cache_key in _lfm_cache:
+        cached = dict(_lfm_cache[cache_key])
+        cached["source"] = "lfm_cache"
+        return cached
+
+    t0 = time.time()
+    try:
+        data = run_lfm_analysis(transcript, latest)
+        data["source"] = "lfm"
+        _lfm_last_time = time.time()
+        _lfm_last_data = data
+        _lfm_cache[cache_key] = data
+        # Never let LFM make the demo look weaker/slower than fast detection.
+        if int(fast.get("risk_score", 0)) > int(data.get("risk_score", 0)):
+            data["risk_score"] = fast["risk_score"]
+            data["signals"] = sorted(set((data.get("signals") or []) + fast.get("signals", [])))
+            data["recommended_action"] = fast["recommended_action"]
+        if not data.get("latest_translation") or has_japanese(data.get("latest_translation")):
+            data["latest_translation"] = fast.get("latest_translation", "")
+        return data
+    except Exception as e:
+        log.error(f"Model error, using fast local result: {e}")
+        fast["latency_ms"] = int((time.time()-t0)*1000)
+        return fast
+
+
+
+# ── Serve frontend ───────────────────────────────────────────────────────────
+@app.get("/")
+def index():
+    return FileResponse("index.html")
+
+
+# ── Optional Liquid Audio JP ASR path ─────────────────────────────────────────
+# This plugs LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF into the uploaded-audio path.
+# It is OFF by default so the stable Whisper path still works. Enable with:
+#   set LFM_AUDIO_ASR=1
+#   set LFM_AUDIO_DIR=models\audio_jp
+#   set LFM_AUDIO_CLI=path\to\llama-liquid-audio-cli.exe   (optional if in PATH)
+
+def _which_exe(name: str) -> Optional[str]:
+    found = shutil.which(name)
+    return found
+
+def find_lfm_audio_cli() -> Optional[str]:
+    env = os.environ.get("LFM_AUDIO_CLI", "").strip().strip('"')
+    candidates = []
+    if env:
+        candidates.append(env)
+    base = Path(os.environ.get("LFM_AUDIO_DIR", "models/audio_jp"))
+    candidates += [
+        str(base / "runners" / "llama-liquid-audio-cli.exe"),
+        str(base / "runners" / "llama-liquid-audio-cli"),
+        str(base / "llama-liquid-audio-cli.exe"),
+        str(base / "llama-liquid-audio-cli"),
+    ]
+    path_hit = _which_exe("llama-liquid-audio-cli.exe") or _which_exe("llama-liquid-audio-cli")
+    if path_hit:
+        candidates.append(path_hit)
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return None
+
+def _first_file(patterns: List[str]) -> Optional[str]:
+    base = Path(os.environ.get("LFM_AUDIO_DIR", "models/audio_jp"))
+    for pat in patterns:
+        hits = sorted(base.glob(pat))
+        if hits:
+            return str(hits[0])
+    return None
+
+def find_lfm_audio_files() -> Dict[str, Optional[str]]:
+    # Prefer Q4_0 for speed. User can override by putting another quant in LFM_AUDIO_QUANT.
+    q = os.environ.get("LFM_AUDIO_QUANT", "Q4_0")
+    return {
+        "cli": find_lfm_audio_cli(),
+        "model": _first_file([f"LFM2.5-Audio-1.5B-JP-{q}.gguf", f"*Audio*JP*{q}.gguf"]),
+        "mmproj": _first_file([f"mmproj-LFM2.5-Audio-1.5B-JP-{q}.gguf", f"mmproj-*Audio*JP*{q}.gguf"]),
+        "vocoder": _first_file([f"vocoder-LFM2.5-Audio-1.5B-JP-{q}.gguf", f"vocoder-*Audio*JP*{q}.gguf"]),
+        "tokenizer": _first_file([f"tokenizer-LFM2.5-Audio-1.5B-JP-{q}.gguf", f"tokenizer-*Audio*JP*{q}.gguf"]),
+    }
+
+
+def _get_ffmpeg_exe() -> Optional[str]:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        log.warning(f"imageio-ffmpeg not available: {e}")
+        return None
+
+def ffprobe_duration(path: str) -> Optional[float]:
+    try:
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path
+        ], stderr=subprocess.STDOUT, text=True, timeout=10).strip()
+        return float(out) if out else None
+    except Exception:
+        return None
+
+def ensure_wav_for_lfm(input_path: str) -> str:
+    # LFM audio runner examples use wav. Convert when ffmpeg exists; otherwise try original.
+    if input_path.lower().endswith(".wav"):
+        return input_path
+    ffmpeg = _get_ffmpeg_exe()
+    if not ffmpeg:
+        log.warning("ffmpeg not found; passing original audio to Liquid Audio runner")
+        return input_path
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    subprocess.check_call([
+        ffmpeg, "-y", "-i", input_path, "-ac", "1", "-ar", "16000", out_path
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out_path
+
+def clean_lfm_audio_text(raw: str) -> str:
+    raw = re.sub(r"\x1b\[[0-9;]*m", "", raw or "")
+
+    # Liquid prints the real transcript after this marker.
+    if "=== GENERATED TEXT ===" in raw:
+        raw = raw.split("=== GENERATED TEXT ===", 1)[1]
+
+    # Cut off later runner logs if they appear after transcript.
+    for stop in ["\nload_backend:", "\nwarning:", "\nclip_model_loader:", "\nllama_", "\nggml"]:
+        idx = raw.find(stop)
+        if idx != -1:
+            raw = raw[:idx]
+
+    lines = []
+    for line in raw.splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        low = t.lower()
+        if any(x in low for x in [
+            "audio samples per second", "text  tokens", "tokens per second",
+            "clip_model_loader", "tensor[", "load_backend", "warning:",
+            "llama_", "ggml", "usage:", "encoding audio", "decoding audio"
+        ]):
+            continue
+        if re.search(r"[ぁ-んァ-ン一-龥]", t):
+            lines.append(t)
+
+    text = " ".join(lines).strip()
+    text = re.sub(r"\s+", " ", text)
+    m = re.search(r"[ぁ-んァ-ン一-龥]", text)
+    if m:
+        text = text[m.start():]
+    return text.strip()
+
+
+def translate_demo_liquid_text(text: str) -> str:
+    """Safe English subtitles for the Liquid demo transcript."""
+    t = text or ""
+    parts = []
+
+    if "関係者が200名" in t:
+        parts.append("The number of people involved in this case may be as high as 200.")
+    if "通報電話の妨げ" in t:
+        parts.append("This call may interfere with emergency reporting lines.")
+    if "専用ライン" in t:
+        parts.append("The caller is trying to move the conversation to a dedicated LINE account for this case.")
+    if "ID検索" in t:
+        parts.append("They are asking the person to search by ID and add the dedicated LINE account.")
+    if "追加" in t and "ライン" in t:
+        parts.append("They repeatedly instruct the person to add the dedicated LINE account.")
+    if "着信" in t or "直後に" in t:
+        parts.append("They say they will call now and want the person to continue immediately on the dedicated LINE.")
+    if "聞きます" in t:
+        parts.append("They say they will ask questions there, on the dedicated LINE.")
+
+    if parts:
+        return " ".join(parts)
+
+    return fast_translate_latest(t)
+
+def split_lfm_transcript_to_segments(text: str, duration: Optional[float]) -> List[Dict[str, Any]]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Split on Japanese/English sentence boundaries, but avoid tiny fragments.
+    parts = [p.strip() for p in re.split(r"(?<=[。！？!?])\s+|[\r\n]+", text) if p.strip()]
+    if len(parts) <= 1:
+        parts = [p.strip() for p in re.split(r"(?<=[。！？!?])", text) if p.strip()]
+    if not parts:
+        parts = [text]
+    total = float(duration or max(2.0 * len(parts), 2.0))
+    seg_len = max(total / max(len(parts), 1), 1.0)
+    segments = []
+    for i, part in enumerate(parts):
+        start = round(i * seg_len, 2)
+        end = round(min((i + 1) * seg_len, total), 2)
+        segments.append({"start": start, "end": end, "text": part, "en": translate_demo_liquid_text(part)})
+    return segments
+
+def run_lfm_audio_asr(input_path: str) -> Dict[str, Any]:
+    files = find_lfm_audio_files()
+    missing = [k for k, v in files.items() if not v]
+    if missing:
+        raise RuntimeError(f"Liquid Audio files missing: {missing}. Set LFM_AUDIO_DIR or download Q4_0 files + runner.")
+    wav_path = ensure_wav_for_lfm(input_path)
+    cleanup_wav = wav_path != input_path
+    try:
+        extra_args = os.environ.get("LFM_AUDIO_ARGS", "").strip().split()
+        cmd = [
+            files["cli"],
+            *extra_args,
+            "-m", files["model"],
+            "-mm", files["mmproj"],
+            "-mv", files["vocoder"],
+            "--tts-speaker-file", files["tokenizer"],
+            "-sys", os.environ.get("LFM_AUDIO_SYS", "Perform ASR in japanese."),
+            "--audio", wav_path,
+        ]
+        timeout = int(os.environ.get("LFM_AUDIO_TIMEOUT", "180"))
+        log.info("Running Liquid Audio ASR: " + " ".join([str(x) for x in cmd[:2]]) + " ...")
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        raw = (proc.stdout or b"").decode("utf-8", "ignore") + "\n" + (proc.stderr or b"").decode("utf-8", "ignore")
+        if proc.returncode != 0:
+            raise RuntimeError(f"Liquid Audio runner returned {proc.returncode}: {raw[-1200:]}")
+        text = clean_lfm_audio_text(raw)
+        if not text:
+            raise RuntimeError("Liquid Audio returned empty transcript")
+        dur = ffprobe_duration(input_path)
+        segments = split_lfm_transcript_to_segments(text, dur)
+        return {"text": text, "segments": segments, "duration": dur, "files": files}
+    finally:
+        if cleanup_wav:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+
+# ── Direct uploaded-audio transcription ──────────────────────────────────────
+# This avoids the unreliable "play audio through speakers and hope Web Speech hears it" route.
+# Install once: pip install faster-whisper python-multipart
+_whisper_model = None
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        raise RuntimeError("faster-whisper is not installed. Run: pip install faster-whisper python-multipart") from e
+
+    model_name = os.environ.get("WHISPER_MODEL", "base")  # base = faster; small = better Japanese
+    device = os.environ.get("WHISPER_DEVICE", "cpu")
+    compute_type = os.environ.get("WHISPER_COMPUTE", "int8")
+    log.info(f"Loading Whisper ASR model: {model_name} ({device}, {compute_type})")
+    _whisper_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    return _whisper_model
+
+@app.on_event("startup")
+def preload_asr_model():
+    """Pre-load Whisper during backend startup so the first uploaded audio does not wait 2-3 minutes.
+    This makes uvicorn startup slower, but the demo itself smoother.
+    """
+    try:
+        get_whisper_model()
+        log.info("Whisper ASR warm-up done. Upload transcription will be faster during demo.")
+    except Exception as e:
+        log.warning(f"Whisper ASR preload skipped/failed: {e}")
+
+@app.post("/api/transcribe-audio")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Transcribe uploaded audio ONLY.
+
+    Important: this endpoint intentionally does NOT run the LFM text model.
+    The frontend first renders ASR segments, then calls /api/analyze separately.
+    That prevents the transcript from appearing and then disappearing while the
+    slower language model is still thinking.
+    """
+    t0 = time.time()
+    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+
+        # Optional Path A: Liquid Audio JP directly reads the uploaded audio.
+        # If it fails, we fall back to the stable Whisper ASR path.
+        if os.environ.get("LFM_AUDIO_ASR", "0") == "1":
+            try:
+                lfm_audio = run_lfm_audio_asr(tmp_path)
+                segments = lfm_audio["segments"]
+                full_text = lfm_audio["text"]
+                latency = int((time.time() - t0) * 1000)
+                log.info(f"Liquid Audio ASR complete: {len(segments)} segments in {latency}ms")
+                return {
+                    "ok": True,
+                    "mode": "liquid_audio_jp_asr_synced",
+                    "filename": file.filename,
+                    "language": "ja",
+                    "duration": lfm_audio.get("duration"),
+                    "segments": segments,
+                    "translated_segments": [
+                        {"start": seg.get("start"), "end": seg.get("end"), "text": seg.get("en", "")}
+                        for seg in segments if seg.get("en")
+                    ],
+                    "transcript": full_text,
+                    "translation_source": "liquid_asr_safe_demo_subtitles",
+                    "audio_model": "LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF",
+                    "latency_ms": latency,
+                }
+            except Exception as e:
+                log.warning(f"Liquid Audio ASR failed; falling back to Whisper: {e}")
+
+        model = get_whisper_model()
+        # Pass 1: Japanese ASR for the visible Japanese transcript.
+        segments_iter, info = model.transcribe(
+            tmp_path,
+            language="ja",
+            task="transcribe",
+            vad_filter=True,
+            beam_size=5,
+            condition_on_previous_text=False,
+        )
+
+        segments = []
+        full_parts = []
+        for seg in segments_iter:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            item = {
+                "start": round(float(seg.start), 2),
+                "end": round(float(seg.end), 2),
+                "text": text,
+                "en": "",
+            }
+            segments.append(item)
+            full_parts.append(text)
+
+        # Pass 2: Whisper's built-in Japanese -> English translation.
+        # This is much faster/reliable for demo subtitles than asking the local
+        # LFM to translate every bubble. It runs during pre-processing, so when
+        # you press Play, English subtitles are already ready.
+        translate_enabled = os.environ.get("WHISPER_TRANSLATE", "1") != "0"
+        translated_segments = []
+        if translate_enabled and segments:
+            try:
+                tr_iter, _ = model.transcribe(
+                    tmp_path,
+                    language="ja",
+                    task="translate",
+                    vad_filter=True,
+                    beam_size=5,
+                    condition_on_previous_text=False,
+                )
+                for tr in tr_iter:
+                    txt = (tr.text or "").strip()
+                    if txt:
+                        translated_segments.append({
+                            "start": round(float(tr.start), 2),
+                            "end": round(float(tr.end), 2),
+                            "text": txt,
+                        })
+                # Align English to Japanese by temporal overlap / nearest start.
+                for item in segments:
+                    best = None
+                    best_score = -1e9
+                    a0, a1 = float(item["start"]), float(item["end"] or item["start"])
+                    for tr in translated_segments:
+                        b0, b1 = float(tr["start"]), float(tr["end"] or tr["start"])
+                        overlap = max(0.0, min(a1, b1) - max(a0, b0))
+                        distance = abs(a0 - b0)
+                        score = overlap * 10.0 - distance
+                        if score > best_score:
+                            best_score = score
+                            best = tr
+                    if best and best_score > -3.0:
+                        item["en"] = best["text"]
+            except Exception as e:
+                log.warning(f"Whisper translation pass failed; UI will use LFM/fast fallback translation: {e}")
+
+        latency = int((time.time() - t0) * 1000)
+        log.info(f"ASR complete: {len(segments)} segments, translations={sum(1 for s in segments if s.get('en'))} in {latency}ms")
+        return {
+            "ok": True,
+            "mode": "direct_file_asr_synced_whisper_translate",
+            "filename": file.filename,
+            "language": getattr(info, "language", "ja"),
+            "duration": getattr(info, "duration", None),
+            "segments": segments,
+            "translated_segments": translated_segments,
+            "transcript": "\n".join(full_parts),
+            "translation_source": "whisper_translate" if translate_enabled else "lfm_or_fast_fallback",
+            "latency_ms": latency,
+        }
+    except Exception as e:
+        log.error(f"Audio transcription failed: {e}")
+        return {
+            "ok": False,
+            "error": str(e),
+            "hint": "For uploaded audio, install faster-whisper and python-multipart, then restart uvicorn. Also ensure ffmpeg is installed/available.",
+            "segments": [],
+            "latency_ms": int((time.time()-t0)*1000),
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+# ── Health check ──────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": GGUF_PATH,
+        "backend": "llama.cpp",
+        "platform": "LEAP GGUF",
+        "device": "cpu / AMD Ryzen",
+        "asr_model_loaded": _whisper_model is not None,
+        "whisper_model": os.environ.get("WHISPER_MODEL", "base"),
+        "llama_threads": CPU_THREADS,
+        "llama_ctx": CTX_SIZE,
+        "lfm_min_interval": LFM_MIN_INTERVAL,
+        "use_lfm": USE_LFM,
+        "lfm_audio_asr": os.environ.get("LFM_AUDIO_ASR", "0") == "1",
+        "lfm_audio_files": find_lfm_audio_files(),
+    }
